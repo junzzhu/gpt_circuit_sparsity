@@ -264,6 +264,35 @@ class CircuitDataExtractor:
         }
 
 
+def summarize_layer_samples(task_results: Dict[str, Any], top_k: int = 5) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    samples = task_results.get("samples", [])
+    activations = task_results.get("activations", [])
+    if not samples or not activations:
+        return {}
+
+    layer_scores: Dict[str, List[Dict[str, Any]]] = {}
+    for sample, layer_act in zip(samples, activations, strict=True):
+        for layer_name, act in layer_act.items():
+            score = float(act.abs().mean().item())
+            entry = {
+                "input": sample.get("input"),
+                "expected": sample.get("expected"),
+                "predicted": sample.get("predicted"),
+                "correct": sample.get("correct"),
+                "activation": score,
+            }
+            layer_scores.setdefault(layer_name, []).append(entry)
+
+    summary: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for layer_name, entries in layer_scores.items():
+        entries_sorted = sorted(entries, key=lambda x: x["activation"], reverse=True)
+        summary[layer_name] = {
+            "top": entries_sorted[:top_k],
+            "bottom": list(reversed(entries_sorted[-top_k:])) if len(entries_sorted) >= top_k else list(reversed(entries_sorted)),
+        }
+    return summary
+
+
 def load_sparsegpt_checkpoint(checkpoint_path: str, model_name: str, device='cuda'):
     """Load a SparseGPT pruned checkpoint."""
     
@@ -341,6 +370,7 @@ def create_viz_data(
             / experiment_name
         )
 
+        layer_sample_summary = summarize_layer_samples(task_results)
         # Generate circuit data for different k values
         for k in k_values:
             print(f"  Identifying top-{k} circuit components...")
@@ -358,6 +388,7 @@ def create_viz_data(
                 'importance': {name: imp.detach().cpu().numpy() for name, imp in importance.items()},
                 'circuits': circuits,
                 'task_results': task_results,
+                'bridge_samples': layer_sample_summary,
                 'metadata': {
                     'num_samples': num_samples,
                     'total_params': total_params,

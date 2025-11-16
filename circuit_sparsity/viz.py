@@ -1354,6 +1354,109 @@ def render_bridge_summary(viz_data):
             if "step" in trace_df.columns:
                 st.line_chart(trace_df.set_index("step")["loss"], height=300)
             st.table(trace_df[["stage", "loss", "perplexity"]])
+        final_rows = []
+        for dataset_name, rows in prune_metrics["datasets"].items():
+            if not rows:
+                continue
+            final_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "loss": rows[-1]["loss"],
+                    "perplexity": rows[-1]["perplexity"],
+                }
+            )
+        if final_rows:
+            st.subheader("Final metrics")
+            st.table(pd.DataFrame(final_rows).set_index("dataset"))
+
+    bridge_samples = viz_data.get("bridge_samples")
+    selected_layer = None
+    if bridge_samples:
+        selected_layer = render_bridge_circuit_graph(viz_data)
+        render_bridge_sample_distribution(bridge_samples, preferred_layer=selected_layer)
+    elif not prune_metrics:
+        st.info("No additional bridge metadata available for this run.")
+
+
+def render_bridge_circuit_graph(viz_data):
+    circuits = viz_data.get("circuits") or {}
+    components = circuits.get("top_k_components")
+    if not components:
+        st.info("No circuit component data available.")
+        return None
+
+    layers = [name for name, _ in components]
+    scores = [score for _, score in components]
+    xs = list(range(len(layers)))
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=scores,
+            mode="markers+lines",
+            text=layers,
+            hovertemplate="Layer: %{text}<br>Importance: %{y:.4f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Bridge circuit components",
+        xaxis_title="Component index",
+        yaxis_title="Activation importance",
+        template="plotly_white",
+        height=350,
+    )
+
+    events = plotly_events(
+        fig,
+        click_event=True,
+        hover_event=False,
+        key=f"bridge_graph_{viz_data.get('task','')}_{viz_data.get('k','')}",
+    )
+    selected_layer = layers[0]
+    if events:
+        point_idx = events[0].get("pointNumber")
+        if point_idx is not None and 0 <= point_idx < len(layers):
+            selected_layer = layers[int(point_idx)]
+
+    st.caption("Click a point to inspect its samples, or adjust the selector below.")
+    return selected_layer
+
+
+def render_bridge_sample_distribution(bridge_samples: dict, preferred_layer: str | None = None):
+    st.subheader("Sample distribution (bridge)")
+    layers = sorted(bridge_samples.keys())
+    if not layers:
+        st.info("No layer-level samples were captured.")
+        return
+    default_index = 0
+    if preferred_layer in layers:
+        default_index = layers.index(preferred_layer)
+    layer_choice = st.selectbox(
+        "Layer",
+        options=layers,
+        index=default_index,
+        key=f"bridge_samples_{hash(tuple(layers))}",
+    )
+    layer_data = bridge_samples.get(layer_choice, {})
+    top_entries = layer_data.get("top", [])
+    bottom_entries = layer_data.get("bottom", [])
+
+    def _render_table(entries, title):
+        if not entries:
+            st.info(f"No {title.lower()} entries for this layer.")
+            return
+        df = pd.DataFrame(entries)
+        st.markdown(f"**{title}**")
+        st.table(
+            df[["input", "expected", "predicted", "activation"]]
+        )
+
+    cols = st.columns(2)
+    with cols[0]:
+        _render_table(top_entries, "Top activations")
+    with cols[1]:
+        _render_table(bottom_entries, "Lowest activations")
 
 
 def resolve_embedding_assets(viz_data, model_name):

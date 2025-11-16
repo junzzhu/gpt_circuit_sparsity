@@ -1,8 +1,10 @@
+import argparse
 import concurrent.futures
 import functools
 import importlib
 import json
 import os
+import pickle
 import sys
 import threading
 import time
@@ -34,6 +36,27 @@ BLUE = torch.tensor([0, 0, 255])  # base RGB for nodes / edges
 SAMPLES_SHOW = 5
 
 cmap = cm.get_cmap("coolwarm")
+
+
+def _normalize_viz_dir(path: str) -> str:
+    if "://" in path:
+        return path
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _parse_cli_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--viz-dir",
+        action="append",
+        default=[],
+        help="Additional base directories (local or cloud) that contain viz data.",
+    )
+    args, _ = parser.parse_known_args()
+    return [_normalize_viz_dir(p) for p in args.viz_dir]
+
+
+EXTRA_VIZ_DIRS = _parse_cli_args()
 
 
 def list_join(xss: list[list]) -> list:
@@ -224,16 +247,29 @@ def load_data(
     viz_data_path,
 ):
     """Load the big blobs just once (cached)."""
-    assert viz_data_path.endswith(".pt")
-    with bf.BlobFile(viz_data_path, "rb") as f:
-        viz_data = torch.load(f, weights_only=False, map_location="cpu")
-    
+    if viz_data_path.endswith(".pt"):
+        with bf.BlobFile(viz_data_path, "rb") as f:
+            viz_data = torch.load(f, weights_only=False, map_location="cpu")
+    elif viz_data_path.endswith(".pkl"):
+        with bf.BlobFile(viz_data_path, "rb") as f:
+            viz_data = pickle.load(f)
+    else:
+        raise ValueError(f"Unsupported viz data extension: {viz_data_path}")
+
     def _load_config(config_class, config_dict):
         import inspect
+
         param_names = inspect.signature(config_class).parameters.keys()
         return config_class(**{k: v for k, v in config_dict.items() if k in param_names})
 
-    viz_data["importances"]["beeg_model_config"] = _load_config(GPTConfig, viz_data["importances"]["beeg_model_config"])
+    importances = viz_data.get("importances")
+    if (
+        isinstance(importances, dict)
+        and isinstance(importances.get("beeg_model_config"), dict)
+    ):
+        importances["beeg_model_config"] = _load_config(
+            GPTConfig, importances["beeg_model_config"]
+        )
 
     return viz_data
 
@@ -1206,6 +1242,17 @@ def local_listdir(path):
     return bf.listdir(path)
 
 
+def _resolve_viz_file(base_dir):
+    for ext in ("pt", "pkl"):
+        cand = f"{base_dir}/viz_data.{ext}"
+        try:
+            if bf.exists(cand):
+                return cand
+        except FileNotFoundError:
+            pass
+    return None
+
+
 def get_fatk(viz_data_path):
     ks = [int(x) for x in local_listdir(viz_data_path) if x.isdigit()]
     ks.sort()
@@ -1213,7 +1260,10 @@ def get_fatk(viz_data_path):
     @cache("get_loss_for_k_v0")
     def _get_loss_for_k(viz_data_path, k):
         try:
-            dat = load_data(viz_data_path + f"/{k}/viz_data.pt")
+            viz_file = _resolve_viz_file(viz_data_path + f"/{k}")
+            if viz_file is None:
+                return None
+            dat = load_data(viz_file)
             return dat["all_loss"][-1][1]
         except FileNotFoundError:
             return None
@@ -1222,6 +1272,272 @@ def get_fatk(viz_data_path):
     loss_at_k = {k: v for k, v in loss_at_k.items() if v is not None}
 
     return ks, loss_at_k
+
+
+def render_bridge_summary(viz_data):
+    st.subheader("Bridge export summary")
+    meta_cols = st.columns(3)
+    with meta_cols[0]:
+        st.metric("Task accuracy", f"{viz_data.get('task_results', {}).get('accuracy', 0):.2%}")
+    with meta_cols[1]:
+        sparsity = viz_data.get("sparsity")
+        if sparsity is not None:
+            st.metric("Model sparsity", f"{sparsity:.2%}")
+        else:
+            st.metric("Model sparsity", "N/A")
+    with meta_cols[2]:
+        st.metric("k", viz_data.get("k", "N/A"))
+
+    st.markdown(
+        f"**Model:** {viz_data.get('model_name', 'unknown')} &nbsp;&nbsp; "
+        f"**Task:** {viz_data.get('task', 'unknown')} &nbsp;&nbsp; "
+        f"**Experiment:** {viz_data.get('experiment', 'unknown')}"
+    )
+
+    circuits = viz_data.get("circuits", {})
+    top_components = circuits.get("top_k_components", [])
+    if top_components:
+        st.subheader("Top components")
+        comp_df = pd.DataFrame(top_components, columns=["component", "score"])
+        st.table(comp_df)
+
+    layer_stats = circuits.get("all_importance")
+    if layer_stats:
+        st.subheader("Layer activation overview")
+        sorted_layers = sorted(layer_stats.items(), key=lambda x: x[1], reverse=True)
+        layer_df = pd.DataFrame(sorted_layers, columns=["layer", "avg_activation"])
+        st.bar_chart(layer_df.set_index("layer"))
+        selected_layer = st.selectbox(
+            "Inspect layer",
+            options=[layer for layer, _ in sorted_layers],
+        )
+        st.metric(
+            "Average activation magnitude",
+            f"{layer_stats[selected_layer]:.4f}",
+        )
+
+    samples = (viz_data.get("task_results") or {}).get("samples", [])
+    if samples:
+        st.subheader("Sample predictions")
+        max_rows = min(len(samples), 10)
+        simple_rows = []
+        for sample in samples[:max_rows]:
+            simple_rows.append(
+                {
+                    k: v
+                    for k, v in sample.items()
+                    if k in {"input", "expected", "predicted", "correct"}
+                }
+            )
+        st.table(pd.DataFrame(simple_rows))
+
+    metadata = viz_data.get("metadata", {})
+    if metadata:
+        st.subheader("Metadata")
+        st.json(metadata)
+
+    prune_metrics = viz_data.get("prune_metrics")
+    if prune_metrics and prune_metrics.get("datasets"):
+        st.subheader("Prune loss trace")
+        dataset_names = sorted(prune_metrics["datasets"].keys())
+        default_dataset = dataset_names[0]
+        select_key = f"prune_dataset_{viz_data.get('task', '')}_{viz_data.get('k', '')}"
+        selected_dataset = st.selectbox(
+            "Dataset",
+            options=dataset_names,
+            index=dataset_names.index(default_dataset),
+            key=select_key,
+        )
+        trace_entries = prune_metrics["datasets"].get(selected_dataset, [])
+        if trace_entries:
+            trace_df = pd.DataFrame(trace_entries)
+            if "step" in trace_df.columns:
+                st.line_chart(trace_df.set_index("step")["loss"], height=300)
+            st.table(trace_df[["stage", "loss", "perplexity"]])
+
+
+def resolve_embedding_assets(viz_data, model_name):
+    embed_data = viz_data.get("embedding_data")
+    if embed_data and embed_data.get("token_embeddings") is not None:
+        return {
+            "token": embed_data["token_embeddings"],
+            "pos": embed_data.get("positional_embeddings"),
+            "tokenizer_name": embed_data.get("tokenizer_name"),
+            "source": "bridge",
+        }
+
+    if "importances" not in viz_data:
+        return None
+
+    model_path = get_model_path(model_name)
+    try:
+        token = get_embed_weights(model_path)
+    except FileNotFoundError:
+        return None
+
+    try:
+        pos = get_model_weights(model_path, lambda x: x["transformer.wpe.weight"]).half()
+    except FileNotFoundError:
+        pos = None
+
+    tokenizer_name = viz_data["importances"]["beeg_model_config"].tokenizer_name
+
+    return {
+        "token": token,
+        "pos": pos,
+        "tokenizer_name": tokenizer_name,
+        "model_path": model_path,
+        "source": "registry",
+    }
+
+
+def render_embedding_tab(viz_data, model_name):
+    embedding_info = resolve_embedding_assets(viz_data, model_name)
+    if embedding_info is None or embedding_info.get("token") is None:
+        st.info("No embedding weights available for this model/export.")
+        return
+
+    embed_weight = embedding_info["token"].to(torch.float32)
+    st.caption(f"Embedding source: {embedding_info.get('source', 'unknown')}")
+
+    chs_used_inds = torch.arange(embed_weight.shape[1])  # d_model
+    tokens_used_mask = torch.ones(embed_weight.shape[0], dtype=torch.bool)
+
+    cols = st.columns([1, 1])
+    tokenizer_name = embedding_info.get("tokenizer_name")
+    if tokenizer_name is None and "importances" in viz_data:
+        tokenizer_name = viz_data["importances"]["beeg_model_config"].tokenizer_name
+
+    with cols[0]:
+        cols2 = st.columns([1, 2, 1])
+        with cols2[0]:
+            use_pca = st.toggle(
+                "PCA components",
+                value=False,
+            )
+        with cols2[1]:
+            chidx = st.selectbox(
+                "res channel index",
+                options=[
+                    f"{ch} (tokens writing: {(embed_weight[:, ch] != 0).sum():d})"
+                    for ch in chs_used_inds.tolist()[: min(100, len(chs_used_inds))]
+                ],
+                index=0,
+            )
+            chidx = int(chidx.split(" ")[0])
+
+        with cols2[2]:
+            st.text(f"encname: {tokenizer_name or 'unknown'}")
+
+        if use_pca:
+            if (
+                embedding_info.get("source") == "registry"
+                and embedding_info.get("model_path") is not None
+            ):
+                U, S, V = get_embed_weights_pca(
+                    embedding_info["model_path"], q=min(100, embed_weight.shape[1])
+                )
+            else:
+                max_q = min(embed_weight.shape[0], embed_weight.shape[1])
+                q = max(1, min(100, max_q - 1 if max_q > 1 else 1))
+                U, S, V = torch.pca_lowrank(embed_weight, q=q)
+            component_idx = min(chidx, U.shape[1] - 1)
+            embsort = U[:, component_idx].cpu().sort(descending=True)
+        else:
+            embsort = embed_weight[:, chidx].sort(descending=True)
+
+        def _filter_embsort(xs):
+            return [
+                x
+                for x, tok in zip(xs, embsort.indices, strict=True)
+                if tokens_used_mask[tok] and embed_weight[tok, chidx] != 0
+            ]
+
+        token_display_warning = False
+        enc = None
+        if tokenizer_name:
+            try:
+                enc = get_encoding(tokenizer_name)
+            except (KeyError, ValueError):
+                token_display_warning = True
+        else:
+            token_display_warning = True
+        if token_display_warning:
+            st.warning(
+                "Tokenizer not available via tiktoken; token strings will be approximated by IDs."
+            )
+
+        cols2 = st.columns([1, 1])
+        with cols2[0]:
+            st.markdown(
+                "**top 20 tokens by weight (filtered for 2048 most common tokens)**"
+            )
+            st.table(
+                pd.DataFrame(
+                    {
+                        "tokid": _filter_embsort(embsort.indices.tolist())[:20],
+                        "token": [
+                            decode_single_token(enc, t).replace(" ", "␣")
+                            if enc
+                            else f"<tok {t}>"
+                            for t in _filter_embsort(embsort.indices.tolist())[:20]
+                        ],
+                        "weight": _filter_embsort(embsort.values.tolist())[:20],
+                    }
+                ).set_index("token")
+            )
+        with cols2[1]:
+            st.markdown(
+                "**bottom 20 tokens by weight (filtered for 2048 most common tokens)**"
+            )
+            st.table(
+                pd.DataFrame(
+                    {
+                        "tokid": _filter_embsort(embsort.indices.tolist())[-20:][::-1],
+                        "token": [
+                            decode_single_token(enc, t).replace(" ", "␣")
+                            if enc
+                            else f"<tok {t}>"
+                            for t in _filter_embsort(embsort.indices.tolist())[-20:][
+                                ::-1
+                            ]
+                        ],
+                        "weight": _filter_embsort(embsort.values.tolist())[-20:][::-1],
+                    }
+                ).set_index("token")
+            )
+
+    with cols[1]:
+        fig, ax = plt.subplots()
+        sns.histplot(
+            embsort.values.cpu().numpy(),
+            ax=ax,
+        )
+        ax.set_yscale("log")
+        st.pyplot(fig, use_container_width=False)
+
+    wpe = embedding_info.get("pos")
+    if wpe is None:
+        st.info("Positional embedding weights not available for this model/export.")
+        return
+
+    wpe = wpe.to(torch.float32)
+    seq_len = min(256, wpe.shape[0])
+    hidden_dim = min(512, wpe.shape[1])
+    if seq_len == 0 or hidden_dim == 0:
+        st.warning("Positional embedding tensor is empty; skipping heatmap.")
+        return
+
+    wpe_crop = wpe[:seq_len, :hidden_dim]
+    nonzero_cols = (wpe_crop != 0).any(dim=0)
+    if nonzero_cols.any():
+        wpe_crop = wpe_crop[:, nonzero_cols]
+
+    fig, ax = plt.subplots()
+    sns.heatmap(wpe_crop, ax=ax, center=0, cbar_kws={"label": "symlog"}, norm="symlog")
+    ax.set_title("Positional embeddings (first 256 positions, 512 dims)")
+    st.pyplot(fig, use_container_width=False)
+    st.code(f"wpe.shape={wpe.shape}, crop={wpe_crop.shape}")
 
 
 def faithfulness_at_k_plot(viz_data_path, viz_data):
@@ -1328,23 +1644,49 @@ def main():
     status_placeholder = st.empty()
     trace_mon_kill = install_trace_mon(status_placeholder)
 
-    base_paths = [
-        os.path.expanduser(f"{MODEL_BASE_DIR}/viz"),
-    ]
+    default_base = os.path.expanduser(f"{MODEL_BASE_DIR}/viz")
+    ordered_paths = [default_base, *EXTRA_VIZ_DIRS]
+    base_paths = []
+    seen_paths = set()
+    for path in ordered_paths:
+        if path not in seen_paths:
+            seen_paths.add(path)
+            base_paths.append(path)
     modelnamecol, datasetcol, sweepnamecol, kcol, k_out_col = st.columns(
         [1.5, 1, 1, 1, 0.25]
     )
     tabs = st.tabs(["main viz", "wte/wpe viz"])
     with modelnamecol:
+        model_options = []
+
+        def get_models_for_base_path(base_path):
+            try:
+                return list(local_listdir(base_path))
+            except FileNotFoundError:
+                return []
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(get_models_for_base_path, base_paths))
+            for model_list in results:
+                model_options.extend(model_list)
+
+        model_options = sorted(set(model_options))
+
+        if not model_options:
+            st.error("No models found in the configured viz directories.")
+            return
+
+        preferred_models = ["csp_yolo1", "csp_yolo2"]
+        default_index = 0
+        for preferred in preferred_models:
+            if preferred in model_options:
+                default_index = model_options.index(preferred)
+                break
+
         model_name = st.selectbox(
             "model",
-            options=[
-                #######
-                "csp_yolo1",
-                "csp_yolo2",
-                # "dan-bridges-afrac8",
-            ],
-            index=0,
+            options=model_options,
+            index=default_index,
         )
     with datasetcol:
         dataset_options = []
@@ -1393,14 +1735,16 @@ def main():
         ks = []
 
         def get_ks_for_base_path(base_path):
-            local_ks = []
             viz_data_path = f"{base_path}/{model_name}/{dataset_name}/{sweep_name}"
-            # Gather all candidate paths to check for each x
-            candidate_xs = [
-                x for x in local_listdir(viz_data_path) if x.isdigit() or x == "k_optim"
-            ]
-            local_ks = [int(x) if x != "k_optim" else x for x in candidate_xs]
-            return local_ks
+            try:
+                candidate_xs = [
+                    x
+                    for x in local_listdir(viz_data_path)
+                    if x.isdigit() or x == "k_optim"
+                ]
+            except FileNotFoundError:
+                return []
+            return [int(x) if x != "k_optim" else x for x in candidate_xs]
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(get_ks_for_base_path, base_paths))
@@ -1418,167 +1762,72 @@ def main():
         if isinstance(k, str):
             k = k.split(" ")[0]
 
+    viz_data = None
     for base_path in base_paths:
         viz_data_path = f"{base_path}/{model_name}/{dataset_name}/{sweep_name}"
         print(f"{viz_data_path=}")
-        if bf.exists(viz_data_path + f"/{k}/viz_data.pt"):
-            viz_data = load_data(viz_data_path + f"/{k}/viz_data.pt")
+        viz_file = _resolve_viz_file(viz_data_path + f"/{k}")
+        if viz_file is not None:
+            viz_data = load_data(viz_file)
             break
-    else:
-        raise ValueError(f"No viz data found for {viz_data_path}/{k}")
+    if viz_data is None:
+        raise ValueError(f"No viz data found for any base path at {model_name}/{dataset_name}/{sweep_name}/{k}")
 
-    mask_L0 = sum([v.numel() for v in viz_data["circuit_data"].values()])
+    is_bridge_data = "importances" not in viz_data
+
+    if not is_bridge_data:
+        mask_L0 = sum([v.numel() for v in viz_data["circuit_data"].values()])
+    else:
+        mask_L0 = viz_data.get("k", "N/A")
+
     with k_out_col:
         st.html(f"<br>k=<b>{mask_L0}</b>")
 
-    train_metrics = get_progress_data3(model_name)
+    train_metrics = [] if is_bridge_data else get_progress_data3(model_name)
 
     st.code(f"{viz_data_path=}")
-    with tabs[0]:
-        jacob_viz(
-            viz_data,
-        )
-        faithfulness_at_k_plot(viz_data_path, viz_data)
-        cols = st.columns([2, 1, 1])
+    if is_bridge_data:
+        with tabs[0]:
+            render_bridge_summary(viz_data)
+    else:
+        with tabs[0]:
+            jacob_viz(
+                viz_data,
+            )
+            faithfulness_at_k_plot(viz_data_path, viz_data)
+            cols = st.columns([2, 1, 1])
 
-        with cols[0]:
-            plot_all_pruning_losses(viz_data, k)
+            with cols[0]:
+                plot_all_pruning_losses(viz_data, k)
 
-        with cols[1]:
-            pass
-        with cols[2]:
-            st.html("<b>final metrics</b>")
-            most_important_rows = [
-                "test_xent",
-                "num_alive_neurons/c_fc/layer_0",
-                "num_alive_neurons/c_fc/layer_1",
-                "num_alive_neurons/c_fc/layer_2",
-                "num_alive_neurons/c_fc/layer_3",
-                "step",
-                "L0",
-                "L0_non_embed",
-            ]
-
-            def _maybe_item(x):
-                if isinstance(x, torch.Tensor):
-                    return x.item()
-                return x
-
-            if len(train_metrics) > 0:
-                st.table(
-                    {k: _maybe_item(train_metrics[-1][k]) for k in most_important_rows}
-                    | {k: _maybe_item(train_metrics[-1][k]) for k in train_metrics[-1]}
-                )
-
-    with tabs[1]:
-        model_path = get_model_path(model_name)
-        embed_weight = get_embed_weights(model_path)
-
-        assert embed_weight.shape[0] < 50257
-        chs_used_inds = torch.arange(embed_weight.shape[1])  # d_model
-        tokens_used_mask = torch.ones(embed_weight.shape[0], dtype=torch.bool)
-
-        cols = st.columns([1, 1])
-        model_config = viz_data["importances"]["beeg_model_config"]
-        with cols[0]:
-            cols2 = st.columns([1, 2, 1])
-            with cols2[0]:
-                use_pca = st.toggle(
-                    "PCA components",
-                    value=False,
-                )
-            with cols2[1]:
-                chidx = st.selectbox(
-                    "res channel index",
-                    options=[
-                        f"{ch} (tokens writing: {(embed_weight[:, ch] != 0).sum():d})"
-                        for ch in chs_used_inds.tolist()[:100]
-                    ],
-                    index=0,
-                )
-                chidx = int(chidx.split(" ")[0])
-
-            with cols2[2]:
-                st.text(f"encname: {model_config.tokenizer_name}")
-
-            if use_pca:
-                U, S, V = get_embed_weights_pca(model_path, q=100)
-                embsort = U[:, chidx].cpu().sort(descending=True)
-            else:
-                embsort = embed_weight[:, chidx].sort(descending=True)
-
-            def _filter_embsort(xs):
-                return [
-                    x
-                    for x, tok in zip(xs, embsort.indices, strict=True)
-                    if tokens_used_mask[tok] and embed_weight[tok, chidx] != 0
+            with cols[1]:
+                pass
+            with cols[2]:
+                st.html("<b>final metrics</b>")
+                most_important_rows = [
+                    "test_xent",
+                    "num_alive_neurons/c_fc/layer_0",
+                    "num_alive_neurons/c_fc/layer_1",
+                    "num_alive_neurons/c_fc/layer_2",
+                    "num_alive_neurons/c_fc/layer_3",
+                    "step",
+                    "L0",
+                    "L0_non_embed",
                 ]
 
-            enc = get_encoding(model_config.tokenizer_name)
-            cols2 = st.columns([1, 1])
-            with cols2[0]:
-                st.markdown(
-                    "**top 20 tokens by weight (filtered for 2048 most common tokens)**"
-                )
-                st.table(
-                    pd.DataFrame(
-                        {
-                            "tokid": _filter_embsort(embsort.indices.tolist())[:20],
-                            "token": [
-                                decode_single_token(enc, t).replace(" ", "␣")
-                                for t in _filter_embsort(embsort.indices.tolist())[:20]
-                            ],
-                            "weight": _filter_embsort(embsort.values.tolist())[:20],
-                        }
-                    ).set_index("token")
-                )
-            with cols2[1]:
-                st.markdown(
-                    "**bottom 20 tokens by weight (filtered for 2048 most common tokens)**"
-                )
-                st.table(
-                    pd.DataFrame(
-                        {
-                            "tokid": _filter_embsort(embsort.indices.tolist())[-20:][
-                                ::-1
-                            ],
-                            "token": [
-                                decode_single_token(enc, t).replace(" ", "␣")
-                                for t in _filter_embsort(embsort.indices.tolist())[
-                                    -20:
-                                ][::-1]
-                            ],
-                            "weight": _filter_embsort(embsort.values.tolist())[-20:][
-                                ::-1
-                            ],
-                        }
-                    ).set_index("token")
-                )
-        with cols[1]:
-            # show histogram
-            fig, ax = plt.subplots()
-            sns.histplot(
-                embsort.values.cpu().numpy(),
-                ax=ax,
-            )
-            ax.set_yscale("log")
-            st.pyplot(fig, use_container_width=False)
+                def _maybe_item(x):
+                    if isinstance(x, torch.Tensor):
+                        return x.item()
+                    return x
 
-        # make wpe heatmap
-        wpe = get_model_weights(
-            model_path, lambda x: x["transformer.wpe.weight"]
-        ).half()
-        assert wpe.shape[0] == 1024
-        # (tokpos, embed)
-        wpe = wpe[1:256, :512]
-        # remove fully zero cols
-        wpe = wpe[:, (wpe != 0).sum(dim=0)]
-        fig, ax = plt.subplots()  # figsize=(6.4*2.5, 4.8), dpi=600)
-        sns.heatmap(wpe, ax=ax, center=0, cbar_kws={"label": "symlog"}, norm="symlog")
-        ax.set_title("first 512 of wpe (symlog scale)")
-        st.pyplot(fig, use_container_width=False)  # , dpi=600)
-        st.code(f"wpe.shape={wpe.shape}, {(wpe != 0).sum(dim=0)=}")
-        st.code(f"{wpe=}")
+                if len(train_metrics) > 0:
+                    st.table(
+                        {k: _maybe_item(train_metrics[-1][k]) for k in most_important_rows}
+                        | {k: _maybe_item(train_metrics[-1][k]) for k in train_metrics[-1]}
+                    )
+
+    with tabs[1]:
+        render_embedding_tab(viz_data, model_name)
 
     trace_mon_kill()
     status_placeholder.html("<pre>ready<br>&nbsp;</pre>")
@@ -1712,5 +1961,3 @@ if __name__ == "__main__":
     st.set_page_config(page_title="Circuit viz", layout="wide")
 
     main()
-
-

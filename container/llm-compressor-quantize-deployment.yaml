@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-compressor-service
+spec:
+  selector:
+    app: llm-compressor
+  ports:
+  - protocol: TCP
+    port: 11438              # Port on the Service
+    targetPort: 8501         # Port on the Pod
+  type: NodePort
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-compressor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-compressor
+      version: v01
+  template:
+    metadata:
+      labels:
+        app: llm-compressor
+        version: v01
+    spec:
+      containers:
+      - name: llm-compressor-quantize
+        image: docker.io/library/llm-compressor-quantize:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+        command: ["/bin/bash"]
+        args: ["-c", "trap : TERM INT; sleep infinity & wait"]
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+        ports:
+        - containerPort: 8501
+        volumeMounts:
+        - name: nfs-volume
+          mountPath: /app
+      volumes:
+      - name: nfs-volume
+        nfs:
+          server: nfs_server # server hostname or ip
+          path: /data/tests
+          readOnly: no

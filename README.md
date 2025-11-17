@@ -1,3 +1,43 @@
+# Bridging SparseGPT to Circuit Sparsity Visualizer
+
+To reproduce the bridge between SparseGPT pruning outputs and the circuit sparsity
+visualizer, run the following sequence of commands from a workspace that already
+contains the `sparsegpt` and `gpt_circuit_sparsity` repositories:
+
+```bash
+# Prepare a SparseGPT checkpoint
+git clone https://github.com/junzzhu/sparsegpt.git
+cd sparsegpt
+python opt.py facebook/opt-125m c4 \
+  --sparsity 0.5 \
+  --save ./checkpoints/opt125m_sparse50.pt
+
+# Bridge the checkpoint into the circuit visualizer format
+git clone https://github.com/junzzhu/gpt_circuit_sparsity.git
+cd gpt_circuit_sparsity/
+python bridge.py \
+    --sparsegpt-checkpoint ../sparsegpt/checkpoints/opt125m_sparse50.pt \
+    --model-name facebook/opt-125m \
+    --output-dir ./circuit_viz \
+    --tasks quote_completion,ioi \
+    --k-values 5,10,20,50 \
+    --num-samples 100
+
+# Launch the Streamlit visualizer
+streamlit run circuit_sparsity/viz.py -- --viz-dir $(pwd)/circuit_viz/viz
+```
+
+> **Note:** This bridge is still evolving because SparseGPT’s unstructured, weight-level pruning does **not** reproduce the extreme circuit sparsity assumed in Gao et al.’s pipeline. Their visualizer expects node budgets where only a tiny fraction of weights or activations (on the order of \(10^{-3}\)) remain non-zero, whereas SparseGPT checkpoints typically keep far denser. Until we adapt the pruning/preprocessing flow to match those assumptions, some analyzer views will remain missing.
+
+Sample output from the Streamlit dashboard is shown below:
+
+![Circuit sparsity visualization screenshot](images/ui_circuit_sparsity_visulization.png)
+
+For a containerized workflow you can also build `container/Dockerfile` and then
+deploy the resulting image using `container/llm-compressor-quantize-deployment.yaml`
+to reproduce the bridge inside your orchestration stack.
+
+
 # Circuit Sparsity Visualizer and Models
 
 Tools for inspecting sparse circuit models from Gao et al. 2025. Provides code 
